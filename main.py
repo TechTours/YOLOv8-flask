@@ -1,136 +1,120 @@
-from flask import Flask, request, jsonify, Response, send_file
-from flask_wtf import FlaskForm
-from wtforms import FileField, SubmitField
-from wtforms.validators import InputRequired
-from werkzeug.utils import secure_filename
 import os
 import cv2
 import math
-import cvzone
+from fastapi import FastAPI, UploadFile
+import requests
+import datetime
+from typing import Optional
+import tempfile
 from ultralytics import YOLO
-import exifread  # Import exifread for GPS data extraction
+import numpy as np
 
-app = Flask(__name__)
+app = FastAPI()
 
-app.config['SECRET_KEY'] = 'laurent'
-app.config['UPLOAD_FOLDER'] = 'static/files'
-app.config['IMAGE_FOLDER'] = 'static/images'
+# Define the path where the video will be saved
+output_video_path = "output_video.mp4"
+classNames = ['Cheetah', 'Elephant', 'Lion', 'Rhino']
 
-# Global variables
-image_counter = 0
-classNames = ['cheetah', 'elephant', 'lion', 'rhino']
+# Initialize VideoWriter
+fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+output_video = cv2.VideoWriter(output_video_path, fourcc, 30, (640, 480))  # Adjust frame size as needed
 
-# Initialize YOLO model
-yolo_model = YOLO(model="./best.pt")
+# API endpoint to send detected animal information
+API_URL = "http://194.163.167.131:8020/activity/create"
 
-# Function to save an image
-def save_image(frame, filename):
-    save_dir = os.path.join(os.path.abspath(os.path.dirname(__file__)), app.config['IMAGE_FOLDER'])
-    os.makedirs(save_dir, exist_ok=True)
-    with open(os.path.join(save_dir, filename), 'wb') as img_file:
-        img_file.write(cv2.imencode('.jpg', frame)[1])
+class DetectedAnimalLocation:
+    latitude: Optional[float]
+    longitude: Optional[float]
 
-# Function to extract GPS location info from an image
-def extract_location_info(image_path):
-    with open(image_path, 'rb') as file:
-        tags = exifread.process_file(file)
+def save_and_send_image(frame, latitude, longitude, detected_animal):
+    # Send data to the API
+    timestamp = datetime.datetime.utcnow().isoformat() + 'Z'
+    data = {
+        "animal": detected_animal,
+        "location": "Akagera National Park",  # Update with the actual location
+        "time": timestamp,
+        "longitude": str(longitude),
+        "latitude": str(latitude)
+    }
 
-        if 'GPS GPSLongitude' in tags and 'GPS GPSLatitude' in tags:
-            latitude = tags['GPS GPSLatitude'].values
-            longitude = tags['GPS GPSLongitude'].values
+    response = requests.post(API_URL, json=data)
 
-            latitude = float(latitude[0].num) / float(latitude[0].den)
-            longitude = float(longitude[0].num) / float(longitude[0].den)
-
-            if tags['GPS GPSLatitudeRef'].values == 'S':
-                latitude = -latitude
-            if tags['GPS GPSLongitudeRef'].values == 'W':
-                longitude = -longitude
-
-            return {'latitude': latitude, 'longitude': longitude}
-        else:
-            return None
-
-# Define API endpoint for starting video processing
-@app.route('/start_processing', methods=['POST'])
-def start_processing():
-    # Handle incoming requests, start video processing, and return a response.
-    # You may want to pass parameters in the request data to control the processing.
-    # Example: video_path = request.json.get('video_path')
-    global image_counter
-
-    # Start video processing...
-    video_path = request.json.get('video_path')
-    cap = cv2.VideoCapture(video_path)
-    current_class = None
-
-    def generate_frames():
-        # nonlocal image_counter
-        while True:
-            success, img = cap.read()
-            if not success:
-                break
-
-            # Perform YOLO detection on the frame
-            results = yolo_model(img, stream=True)
-
-            for r in results:
-                boxes = r.boxes
-                for box in boxes:
-                    # Bounding Box
-                    x1, y1, x2, y2 = box.xyxy[0]
-                    x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
-                    w, h = x2 - x1, y2 - y1
-
-                    # Confidence
-                    conf = math.ceil((box.conf[0] * 100)) / 100
-
-                    # Class Name
-                    cls = int(box.cls[0])
-                    if cls == 0:
-                        cvzone.cornerRect(img, (x1, y1, w, h), colorC=(139, 69, 19))
-                        cvzone.putTextRect(img, f'{classNames[cls]} {conf}', (max(0, x1), max(35, y1)), scale=1, thickness=1)
-                    elif cls == 1:
-                        cvzone.cornerRect(img, (x1, y1, w, h), colorC=(139, 69, 19), colorR=(255, 0, 0))
-                        cvzone.putTextRect(img, f'{classNames[cls]} {conf}', (max(0, x1), max(35, y1)), scale=1, thickness=1, colorR=(0, 0, 0))
-                    elif cls == 2:
-                        cvzone.cornerRect(img, (x1, y1, w, h), colorC=(139, 69, 19), colorR=(0, 255, 0))
-                        cvzone.putTextRect(img, f'{classNames[cls]} {conf}', (max(0, x1), max(35, y1)), scale=1, thickness=1, colorR=(0, 0, 0))
-                    elif cls == 3:
-                        cvzone.cornerRect(img, (x1, y1, w, h), colorC=(139, 69, 19), colorR=(0, 0, 255))
-                        cvzone.putTextRect(img, f'{classNames[cls]} {conf}', (max(0, x1), max(35, y1)), scale=1, thickness=1, colorR=(0, 0, 0))
-
-                    # Check if the class is different from the current class
-                    if cls != current_class:
-                        # Take a picture
-                        img_name = f'Detected {classNames[cls]}_{image_counter}.jpg'
-                        save_image(img, img_name)
-
-                        # Update the current class
-                        current_class = cls
-
-            ret, buffer = cv2.imencode('.jpg', img)
-            frame = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-            image_counter += 1
-
-    return Response(generate_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
-
-# Define API endpoint for retrieving GPS location of an image
-@app.route('/get_location/<image_name>', methods=['GET'])
-def get_location(image_name):
-    # Retrieve GPS location information for the specified image and return it as JSON.
-    image_path = os.path.join(os.path.abspath(os.path.dirname(__file__)), app.config['IMAGE_FOLDER'], image_name)
-    
-    if os.path.exists(image_path):
-        location = extract_location_info(image_path)
-        if location:
-            return jsonify(location)
-        else:
-            return jsonify({'message': 'No GPS information found in the image.'}), 404
+    if response.status_code == 201:
+        print(f"Image saved and data sent to API for {detected_animal} at ({latitude}, {longitude}).")
     else:
-        return jsonify({'message': 'Image not found'}), 404
+        print(f"Failed to send data to API. Status code: {response.status_code}")
 
-if __name__ == "__main__":
-    app.run(debug=True)
+def generate_frames(video_file):
+    cap = cv2.VideoCapture(video_file)
+
+    # Initialize YOLO model
+    model = YOLO(model="./best.pt")
+
+    while True:
+        success, img = cap.read()
+        if not success:
+            break
+
+        # Reset the animal counts for each frame
+        animal_counts = {cls: 0 for cls in classNames}
+
+        # Perform YOLO detection on the frame
+        results = model(img, stream=True)
+
+        for r in results:
+            boxes = r.boxes
+            for box in boxes:
+                # Bounding Box
+                x1, y1, x2, y2 = box.xyxy[0]
+                x1, y1, x2, y2 = int(x1), int(y1), int(x2), int(y2)
+                w, h = x2 - x1, y2 - y1
+
+                # Confidence
+                conf = math.ceil((box.conf[0] * 100)) / 100
+
+                # Class Name
+                cls = int(box.cls[0])
+                if cls >= 0 and cls < len(classNames):
+                    cv2.rectangle(img, (x1, y1), (x2, y2), (0, 0, 255), 2)
+                    cv2.putText(img, f'{classNames[cls]} {conf}', (max(
+                        0, x1), max(35, y1)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+                    # Update the animal counts for the detected class
+                    animal_counts[classNames[cls]] += 1
+
+                    # If an animal is detected with confidence >= 0.7, save and send image
+                    if conf >= 0.3:
+                        latitude = "30.7040"
+                        longitude = "1.8796"  
+                        detected_animal = classNames[cls]
+                        save_and_send_image(img, latitude, longitude, detected_animal)
+
+        # Add text to display animal counts in the current frame
+        text = 'Animal Counts in Frame: ' + ', '.join([f'{cls}: {count}' for cls, count in animal_counts.items()])
+        cv2.putText(img, text, (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1, cv2.LINE_AA)
+
+        yield cv2.imencode('.jpg', img)[1].tobytes()
+
+@app.post("/process_video/")
+async def process_video(video_file: UploadFile):
+    # Save the uploaded video file to a temporary file
+    with tempfile.NamedTemporaryFile(delete=False) as temp_video_file:
+        temp_video_path = temp_video_file.name
+        temp_video_file.write(video_file.file.read())
+
+    # Call the generate_frames function to process the uploaded video
+    for frame_data in generate_frames(temp_video_path):
+        # Save the frame to the output video
+        output_video.write(np.frombuffer(frame_data, dtype=np.uint8))
+
+    # Release the output video
+    output_video.release()
+
+    # Remove the temporary video file
+    os.remove(temp_video_path)
+
+    return {"message": "Video processed and images saved."}
+
+@app.get("/")
+async def read_root():
+    return {"message": "Welcome to the Animal Detection API!"}
