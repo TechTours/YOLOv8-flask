@@ -8,12 +8,20 @@ from typing import Optional
 import tempfile
 from ultralytics import YOLO
 import numpy as np
+import random
 
 app = FastAPI()
+
+# Define the latitude and longitude ranges
+lowest_latitude = -2.316111
+highest_latitude = -1.308633
+lowest_longitude = 30.593512
+highest_longitude = 30.825589
 
 # Define the path where the video will be saved
 output_video_path = "output_video.mp4"
 classNames = ['Cheetah', 'Elephant', 'Lion', 'Rhino']
+detected_animals = []
 
 # Initialize VideoWriter
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')
@@ -25,6 +33,10 @@ API_URL = "http://194.163.167.131:8020/activity/create"
 class DetectedAnimalLocation:
     latitude: Optional[float]
     longitude: Optional[float]
+
+# Initialize variables to keep track of detected animals
+detected_animals = {}  # Dictionary to store {animal_id: (last_detected_frame, detected_animal)}
+next_animal_id = 1  # Initialize the next animal ID to 1
 
 def save_and_send_image(frame, latitude, longitude, detected_animal):
     # Send data to the API
@@ -45,6 +57,8 @@ def save_and_send_image(frame, latitude, longitude, detected_animal):
         print(f"Failed to send data to API. Status code: {response.status_code}")
 
 def generate_frames(video_file):
+    global detected_animals 
+    global next_animal_id
     cap = cv2.VideoCapture(video_file)
 
     # Initialize YOLO model
@@ -82,12 +96,19 @@ def generate_frames(video_file):
                     # Update the animal counts for the detected class
                     animal_counts[classNames[cls]] += 1
 
-                    # If an animal is detected with confidence >= 0.7, save and send image
-                    if conf >= 0.3:
-                        latitude = "30.7040"
-                        longitude = "1.8796"  
+                    # If an animal is detected with confidence >= 0.7 and is not already tracked, assign an ID
+                    if conf >= 0.9 and detected_animals.get(cls) is None:
+                        latitude, longitude = generate_random_coordinates()
                         detected_animal = classNames[cls]
+                        animal_id = next_animal_id
+                        next_animal_id += 1  # Increment the next animal ID
+                        detected_animals[animal_id] = (cap.get(cv2.CAP_PROP_POS_FRAMES), detected_animal)
                         save_and_send_image(img, latitude, longitude, detected_animal)
+
+        # Remove animals that have not been detected in the last few frames (e.g., 10 frames)
+        frames_to_keep = cap.get(cv2.CAP_PROP_POS_FRAMES)
+        detected_animals = {animal_id: (frame, animal) for animal_id, (frame, animal) in detected_animals.items()
+                            if frames_to_keep - frame < 10}
 
         # Add text to display animal counts in the current frame
         text = 'Animal Counts in Frame: ' + ', '.join([f'{cls}: {count}' for cls, count in animal_counts.items()])
@@ -95,8 +116,15 @@ def generate_frames(video_file):
 
         yield cv2.imencode('.jpg', img)[1].tobytes()
 
+def generate_random_coordinates():
+    # Generate random latitude and longitude within the specified ranges
+    latitude = random.uniform(lowest_latitude, highest_latitude)
+    longitude = random.uniform(lowest_longitude, highest_longitude)
+    return latitude, longitude
+
 @app.post("/process_video/")
 async def process_video(video_file: UploadFile):
+    global detected_animals 
     # Save the uploaded video file to a temporary file
     with tempfile.NamedTemporaryFile(delete=False) as temp_video_file:
         temp_video_path = temp_video_file.name
